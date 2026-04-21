@@ -2,10 +2,11 @@
 """
 OVDP Monthly Analysis Script
 
-1. Fetch active OVDP ISINs from www.inzhur.reit
-2. Fetch ALL bonds in one request from NBU: bank.gov.ua/depo_securities?json
-3. Filter NBU bonds by active ISINs; check payments[] for coupons in next 30 days
-4. Fire Anthropic Claude Code routine with the filtered list
+1. GET https://www.inzhur.reit/_api/assets → filter type=bond, status=active
+   Provides: isin, availableQuantity, prices (buy/sell), paymentSchedule
+2. GET https://bank.gov.ua/depo_securities?json → couponRate (auk_proc) per ISIN
+3. Merge data, find nextCoupon per bond
+4. Fire Anthropic Claude Code routine with the full payload
 
 Usage:
     ANTHROPIC_ROUTINE_TOKEN=<token> python analyze_ovdp.py
@@ -30,24 +31,14 @@ log = logging.getLogger("ovdp")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-INZHUR_API_URL = (
-    "https://www.inzhur.reit/api/asset-pages"
-    "?filters[$and][0][slug][$eqi]=ovdp"
-    "&populate[SEO]=false"
-    "&populate[assets][fields][0]=isin"
-    "&populate[assets][fields][1]=status"
-    "&populate[assets][populate][securityProperties][fields][0]=id"
-    "&populate[assets][populate][securityProperties][fields][1]=availableQuantity"
-)
-
-NBU_API_URL = "https://bank.gov.ua/depo_securities?json"
-
-ROUTINE_URL = (
+INZHUR_ASSETS_URL = "https://www.inzhur.reit/_api/assets"
+NBU_API_URL       = "https://bank.gov.ua/depo_securities?json"
+ROUTINE_URL       = (
     "https://api.anthropic.com/v1/claude_code/routines/"
     "trig_01TEs2S3TcShv7vDdxnjKmfx/fire"
 )
 
-COUPON_WINDOW_DAYS = 30  # kept for payload metadata only
+COUPON_WINDOW_DAYS = 30
 
 TOKEN = os.environ.get("ANTHROPIC_ROUTINE_TOKEN")
 if not TOKEN:
@@ -60,104 +51,140 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "OVDP-Analyzer/1.0", "Accept": "application/json"})
 
 
-# ── Step 1: fetch active ISINs from inzhur ─────────────────────────────────────
+# ── Step 1: fetch active bonds from inzhur ────────────────────────────────────
 
-def fetch_active_assets() -> list[dict]:
-    """Return list of active assets: {isin, availableQuantity}."""
-    log.info("GET %s", INZHUR_API_URL)
-    resp = SESSION.get(INZHUR_API_URL, timeout=30)
+def fetch_inzhur_bonds() -> list[dict]:
+    """
+    Fetch all assets from inzhur._api/assets, filter type=bond & status=active.
+    Returns list of dicts: {isin, availableQuantity, priceBuy, priceSell, paymentSchedule}.
+    """
+    log.info("GET %s", INZHUR_ASSETS_URL)
+    resp = SESSION.get(INZHUR_ASSETS_URL, timeout=30)
     log.info("  → HTTP %s  %.0f ms", resp.status_code, resp.elapsed.total_seconds() * 1000)
     resp.raise_for_status()
 
-    assets = resp.json()["data"][0]["attributes"]["assets"]["data"]
-    active = []
-    for a in assets:
-        attrs = a["attributes"]
-        status = attrs.get("status", "?")
+    all_assets = resp.json()
+    if not isinstance(all_assets, list):
+        log.error("  unexpected response type: %s", type(all_assets).__name__)
+        return []
 
-        # securityProperties may be {"data": {"id": N, "attributes": {...}}} or flat
-        sp = attrs.get("securityProperties") or {}
-        if isinstance(sp, dict) and "data" in sp:
-            sp = (sp["data"] or {}).get("attributes", {})
-        qty = sp.get("availableQuantity") if isinstance(sp, dict) else None
+    log.info("  total assets: %d", len(all_assets))
 
-        marker = "✓" if status == "active" else "✗"
-        log.info("    %s  %s  [%s]  availableQty=%s", marker, attrs["isin"], status, qty)
+    bonds = []
+    for asset in all_assets:
+        asset_type = asset.get("type", "")
+        status     = asset.get("status", "")
+        details    = asset.get("assetDetails") or {}
+        isin       = details.get("isin") or ""
+        sp         = details.get("securityProperties") or {}
+        qty        = sp.get("availableQuantity")
+        prices     = details.get("prices") or {}
+        schedule   = details.get("paymentSchedule") or []
 
-        if status == "active":
-            active.append({"isin": attrs["isin"], "availableQuantity": qty})
+        is_target = asset_type == "bond" and status == "active"
+        marker = "✓" if is_target else "✗"
+        log.info(
+            "    %s  %-20s  type=%-6s  status=%-10s  isin=%-16s  qty=%s  buy=%s  sell=%s",
+            marker, asset.get("slug", ""), asset_type, status,
+            isin or "—", qty, prices.get("buy"), prices.get("sell"),
+        )
 
-    log.info("  total: %d  active: %d", len(assets), len(active))
-    return active
+        if is_target:
+            bonds.append({
+                "isin":              isin,
+                "availableQuantity": qty,
+                "priceBuy":          prices.get("buy"),
+                "priceSell":         prices.get("sell"),
+                "paymentSchedule":   schedule,
+            })
+
+    log.info("  active bonds (type=bond, status=active): %d", len(bonds))
+    return bonds
 
 
-# ── Step 2: fetch all NBU bonds in one request ─────────────────────────────────
+# ── Step 2: fetch coupon rates from NBU ───────────────────────────────────────
 
-def fetch_nbu_all() -> list[dict]:
+def fetch_nbu_coupon_rates() -> dict[str, float | None]:
+    """
+    Fetch all OVDP from NBU in one request.
+    Returns dict {isin: couponRate} using auk_proc field.
+    """
     log.info("GET %s", NBU_API_URL)
     resp = SESSION.get(NBU_API_URL, timeout=30)
-    log.info("  → HTTP %s  %.0f ms  %d bonds", resp.status_code,
-             resp.elapsed.total_seconds() * 1000, len(resp.json()) if resp.ok else 0)
+    log.info("  → HTTP %s  %.0f ms  %d records",
+             resp.status_code, resp.elapsed.total_seconds() * 1000,
+             len(resp.json()) if resp.ok else 0)
     resp.raise_for_status()
+
     data = resp.json()
     if not isinstance(data, list):
         log.error("  unexpected NBU response type: %s", type(data).__name__)
-        return []
-    return data
+        return {}
+
+    return {
+        rec["cpcode"]: rec.get("auk_proc")
+        for rec in data
+        if "cpcode" in rec
+    }
 
 
-# ── Step 3: build candidate list ──────────────────────────────────────────────
+# ── Step 3: merge and find next coupon ────────────────────────────────────────
 
-def build_candidates(active_assets: list[dict], nbu_bonds: list[dict]) -> list[dict]:
+def find_next_coupon(schedule: list[dict]) -> dict | None:
+    """Return the nearest future coupon payment {date, amount} from a schedule."""
     today = date.today()
+    best = None
+    for p in schedule:
+        if str(p.get("pay_type", "")) != "1":
+            continue
+        try:
+            pay_date = date.fromisoformat(str(p.get("pay_date", ""))[:10])
+        except ValueError:
+            continue
+        if pay_date >= today:
+            if best is None or pay_date < date.fromisoformat(best["date"]):
+                best = {"date": pay_date.isoformat(), "amount": p.get("pay_val")}
+    return best
 
-    log.info("\nMatching %d active assets against NBU data …", len(active_assets))
 
-    nbu_index = {b["cpcode"]: b for b in nbu_bonds if "cpcode" in b}
-    active_isins = {a["isin"] for a in active_assets}
-    log.info("  NBU total bonds: %d  matched: %d",
-             len(nbu_bonds), len(active_isins & nbu_index.keys()))
+def build_candidates(inzhur_bonds: list[dict], nbu_rates: dict[str, float | None]) -> list[dict]:
+    today  = date.today()
+    cutoff = today + timedelta(days=COUPON_WINDOW_DAYS)
 
-    qty_map = {a["isin"]: a["availableQuantity"] for a in active_assets}
+    log.info("\nBuilding candidate list for %d active bonds …", len(inzhur_bonds))
+    log.info("  Coupon window: %s → %s (🔥 marker)", today, cutoff)
 
     candidates = []
-    for asset in active_assets:
-        isin = asset["isin"]
-        bond = nbu_index.get(isin)
-        if not bond:
-            log.info("  %-16s  → not found in NBU", isin)
-            continue
+    for bond in inzhur_bonds:
+        isin         = bond["isin"]
+        coupon_rate  = nbu_rates.get(isin)
+        next_coupon  = find_next_coupon(bond["paymentSchedule"])
 
-        coupon_rate = bond.get("auk_proc")
-        payments = bond.get("payments") or []
+        if coupon_rate is None:
+            log.info("  %-16s  → couponRate not found in NBU", isin)
 
-        # find nearest future coupon (pay_type=1)
-        next_coupon = None
-        for p in payments:
-            if str(p.get("pay_type", "")) != "1":
-                continue
-            try:
-                pay_date = date.fromisoformat(str(p["pay_date"])[:10])
-            except (ValueError, KeyError):
-                continue
-            if pay_date >= today:
-                if next_coupon is None or pay_date < date.fromisoformat(next_coupon["date"]):
-                    next_coupon = {"date": pay_date.isoformat(), "amount": p.get("pay_val")}
-
-        qty = qty_map.get(isin)
+        fire = (
+            next_coupon is not None
+            and today <= date.fromisoformat(next_coupon["date"]) <= cutoff
+        )
         log.info(
-            "  %-16s  rate=%-6s  qty=%-8s  next_coupon=%s",
+            "  %-16s  rate=%-6s  qty=%-10s  buy=%-8s  sell=%-8s  next=%s%s",
             isin,
             f"{coupon_rate}%" if coupon_rate is not None else "n/a",
-            qty if qty is not None else "n/a",
+            bond["availableQuantity"] if bond["availableQuantity"] is not None else "n/a",
+            bond["priceBuy"]  if bond["priceBuy"]  is not None else "—",
+            bond["priceSell"] if bond["priceSell"] is not None else "—",
             next_coupon["date"] if next_coupon else "none",
+            "  🔥" if fire else "",
         )
 
         candidates.append({
-            "isin": isin,
-            "couponRate": coupon_rate,
-            "availableQuantity": qty,
-            "nextCoupon": next_coupon,
+            "isin":              isin,
+            "couponRate":        coupon_rate,
+            "availableQuantity": bond["availableQuantity"],
+            "priceBuy":          bond["priceBuy"],
+            "priceSell":         bond["priceSell"],
+            "nextCoupon":        next_coupon,
         })
 
     return candidates
@@ -169,8 +196,8 @@ def fire_routine(bonds: list[dict]) -> None:
     text = json.dumps(
         {
             "analysisDate": date.today().isoformat(),
-            "windowDays": COUPON_WINDOW_DAYS,
-            "bonds": bonds,
+            "windowDays":   COUPON_WINDOW_DAYS,
+            "bonds":        bonds,
         },
         ensure_ascii=False,
         indent=2,
@@ -178,10 +205,10 @@ def fire_routine(bonds: list[dict]) -> None:
     log.info("\nPayload to routine:\n%s", text)
 
     headers = {
-        "Authorization": f"Bearer {TOKEN}",
+        "Authorization":   f"Bearer {TOKEN}",
         "anthropic-version": "2023-06-01",
-        "anthropic-beta": "experimental-cc-routine-2026-04-01",
-        "Content-Type": "application/json",
+        "anthropic-beta":  "experimental-cc-routine-2026-04-01",
+        "Content-Type":    "application/json",
     }
     log.info("POST %s", ROUTINE_URL)
     resp = requests.post(ROUTINE_URL, headers=headers, json={"text": text}, timeout=60)
@@ -194,23 +221,32 @@ def fire_routine(bonds: list[dict]) -> None:
 
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("OVDP Analysis started  |  date: %s  |  window: %d days",
+    log.info("OVDP Analysis  |  date: %s  |  window: %d days",
              date.today().isoformat(), COUPON_WINDOW_DAYS)
     log.info("=" * 60)
 
-    active_assets = fetch_active_assets()
-    nbu_bonds     = fetch_nbu_all()
-    candidates    = build_candidates(active_assets, nbu_bonds)
+    inzhur_bonds = fetch_inzhur_bonds()
+    nbu_rates    = fetch_nbu_coupon_rates()
+    candidates   = build_candidates(inzhur_bonds, nbu_rates)
 
     log.info("\n" + "=" * 60)
-    log.info("SUMMARY: %d active bond(s)", len(candidates))
+    log.info("SUMMARY: %d bond(s)", len(candidates))
     if candidates:
-        log.info("  %-16s  %-8s  %-10s  %s", "ISIN", "Rate %", "Qty", "Next coupon")
-        log.info("  " + "-" * 54)
+        log.info("  %-16s  %-7s  %-8s  %-8s  %-10s  %s",
+                 "ISIN", "Rate %", "Buy", "Sell", "Qty", "Next coupon")
+        log.info("  " + "-" * 68)
+        today  = date.today()
+        cutoff = today + timedelta(days=COUPON_WINDOW_DAYS)
         for b in sorted(candidates, key=lambda x: float(x["couponRate"] or 0), reverse=True):
-            next_date = b["nextCoupon"]["date"] if b["nextCoupon"] else "—"
-            log.info("  %-16s  %-8s  %-10s  %s",
-                     b["isin"], f"{b['couponRate']}%", b["availableQuantity"], next_date)
+            nc = b["nextCoupon"]
+            next_str = nc["date"] if nc else "—"
+            if nc and today <= date.fromisoformat(nc["date"]) <= cutoff:
+                next_str = "🔥 " + next_str
+            log.info("  %-16s  %-7s  %-8s  %-8s  %-10s  %s",
+                     b["isin"], f"{b['couponRate']}%" if b["couponRate"] else "—",
+                     b["priceBuy"] or "—", b["priceSell"] or "—",
+                     b["availableQuantity"] if b["availableQuantity"] is not None else "—",
+                     next_str)
     log.info("=" * 60)
 
     if not candidates:
