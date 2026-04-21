@@ -4,9 +4,8 @@ OVDP Monthly Analysis Script
 
 1. GET https://www.inzhur.reit/_api/assets → filter type=bond, status=active
    Provides: isin, availableQuantity, prices (buy/sell), paymentSchedule
-2. GET https://bank.gov.ua/depo_securities?json → couponRate (auk_proc) per ISIN
-3. Merge data, find nextCoupon per bond
-4. Fire Anthropic Claude Code routine with the full payload
+2. Find nextCoupon from paymentSchedule; amounts are in kopecks → convert to UAH
+3. Fire Anthropic Claude Code routine with the full payload
 
 Usage:
     ANTHROPIC_ROUTINE_TOKEN=<token> python analyze_ovdp.py
@@ -32,7 +31,6 @@ log = logging.getLogger("ovdp")
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 INZHUR_ASSETS_URL = "https://www.inzhur.reit/_api/assets"
-NBU_API_URL       = "https://bank.gov.ua/depo_securities?json"
 ROUTINE_URL       = (
     "https://api.anthropic.com/v1/claude_code/routines/"
     "trig_01TEs2S3TcShv7vDdxnjKmfx/fire"
@@ -102,36 +100,13 @@ def fetch_inzhur_bonds() -> list[dict]:
     return bonds
 
 
-# ── Step 2: fetch coupon rates from NBU ───────────────────────────────────────
-
-def fetch_nbu_coupon_rates() -> dict[str, float | None]:
-    """
-    Fetch all OVDP from NBU in one request.
-    Returns dict {isin: couponRate} using auk_proc field.
-    """
-    log.info("GET %s", NBU_API_URL)
-    resp = SESSION.get(NBU_API_URL, timeout=30)
-    log.info("  → HTTP %s  %.0f ms  %d records",
-             resp.status_code, resp.elapsed.total_seconds() * 1000,
-             len(resp.json()) if resp.ok else 0)
-    resp.raise_for_status()
-
-    data = resp.json()
-    if not isinstance(data, list):
-        log.error("  unexpected NBU response type: %s", type(data).__name__)
-        return {}
-
-    return {
-        rec["cpcode"]: rec.get("auk_proc")
-        for rec in data
-        if "cpcode" in rec
-    }
-
-
-# ── Step 3: merge and find next coupon ────────────────────────────────────────
+# ── Step 2: find next coupon ──────────────────────────────────────────────────
 
 def find_next_coupon(schedule: list[dict]) -> dict | None:
-    """Return the nearest future coupon payment {date, amount} from a schedule."""
+    """
+    Return the nearest future coupon payment {date, amount} from a schedule.
+    Amounts are stored in kopecks — converted to UAH (divided by 100, rounded to 2).
+    """
     today = date.today()
     best = None
     for p in schedule:
@@ -143,11 +118,13 @@ def find_next_coupon(schedule: list[dict]) -> dict | None:
             continue
         if pay_date >= today:
             if best is None or pay_date < date.fromisoformat(best["date"]):
-                best = {"date": pay_date.isoformat(), "amount": p.get("pay_val")}
+                raw_amount = p.get("amount")
+                amount_uah = round(raw_amount / 100, 2) if raw_amount is not None else None
+                best = {"date": pay_date.isoformat(), "amount": amount_uah}
     return best
 
 
-def build_candidates(inzhur_bonds: list[dict], nbu_rates: dict[str, float | None]) -> list[dict]:
+def build_candidates(inzhur_bonds: list[dict]) -> list[dict]:
     today  = date.today()
     cutoff = today + timedelta(days=COUPON_WINDOW_DAYS)
 
@@ -156,21 +133,16 @@ def build_candidates(inzhur_bonds: list[dict], nbu_rates: dict[str, float | None
 
     candidates = []
     for bond in inzhur_bonds:
-        isin         = bond["isin"]
-        coupon_rate  = nbu_rates.get(isin)
-        next_coupon  = find_next_coupon(bond["paymentSchedule"])
-
-        if coupon_rate is None:
-            log.info("  %-16s  → couponRate not found in NBU", isin)
+        isin        = bond["isin"]
+        next_coupon = find_next_coupon(bond["paymentSchedule"])
 
         fire = (
             next_coupon is not None
             and today <= date.fromisoformat(next_coupon["date"]) <= cutoff
         )
         log.info(
-            "  %-16s  rate=%-6s  qty=%-10s  buy=%-8s  sell=%-8s  next=%s%s",
+            "  %-16s  qty=%-10s  buy=%-8s  sell=%-8s  next=%s%s",
             isin,
-            f"{coupon_rate}%" if coupon_rate is not None else "n/a",
             bond["availableQuantity"] if bond["availableQuantity"] is not None else "n/a",
             bond["priceBuy"]  if bond["priceBuy"]  is not None else "—",
             bond["priceSell"] if bond["priceSell"] is not None else "—",
@@ -180,7 +152,6 @@ def build_candidates(inzhur_bonds: list[dict], nbu_rates: dict[str, float | None
 
         candidates.append({
             "isin":              isin,
-            "couponRate":        coupon_rate,
             "availableQuantity": bond["availableQuantity"],
             "priceBuy":          bond["priceBuy"],
             "priceSell":         bond["priceSell"],
@@ -226,25 +197,25 @@ if __name__ == "__main__":
     log.info("=" * 60)
 
     inzhur_bonds = fetch_inzhur_bonds()
-    nbu_rates    = fetch_nbu_coupon_rates()
-    candidates   = build_candidates(inzhur_bonds, nbu_rates)
+    candidates   = build_candidates(inzhur_bonds)
 
     log.info("\n" + "=" * 60)
     log.info("SUMMARY: %d bond(s)", len(candidates))
     if candidates:
-        log.info("  %-16s  %-7s  %-8s  %-8s  %-10s  %s",
-                 "ISIN", "Rate %", "Buy", "Sell", "Qty", "Next coupon")
-        log.info("  " + "-" * 68)
+        log.info("  %-16s  %-8s  %-8s  %-10s  %s",
+                 "ISIN", "Buy", "Sell", "Qty", "Next coupon")
+        log.info("  " + "-" * 60)
         today  = date.today()
         cutoff = today + timedelta(days=COUPON_WINDOW_DAYS)
-        for b in sorted(candidates, key=lambda x: float(x["couponRate"] or 0), reverse=True):
+        for b in candidates:
             nc = b["nextCoupon"]
             next_str = nc["date"] if nc else "—"
             if nc and today <= date.fromisoformat(nc["date"]) <= cutoff:
                 next_str = "🔥 " + next_str
-            log.info("  %-16s  %-7s  %-8s  %-8s  %-10s  %s",
-                     b["isin"], f"{b['couponRate']}%" if b["couponRate"] else "—",
-                     b["priceBuy"] or "—", b["priceSell"] or "—",
+            log.info("  %-16s  %-8s  %-8s  %-10s  %s",
+                     b["isin"],
+                     b["priceBuy"]  if b["priceBuy"]  is not None else "—",
+                     b["priceSell"] if b["priceSell"] is not None else "—",
                      b["availableQuantity"] if b["availableQuantity"] is not None else "—",
                      next_str)
     log.info("=" * 60)
