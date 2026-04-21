@@ -12,12 +12,22 @@ Usage:
 """
 
 import json
+import logging
 import os
 import sys
 import time
 from datetime import date, timedelta
 
 import requests
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("ovdp")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -54,18 +64,26 @@ SESSION.headers.update({"User-Agent": "OVDP-Analyzer/1.0", "Accept": "applicatio
 
 def fetch_active_isins() -> list[str]:
     """Return list of active OVDP ISINs from inzhur.reit."""
-    print("Fetching OVDP list from www.inzhur.reit …")
+    log.info("GET %s", INZHUR_API_URL)
     resp = SESSION.get(INZHUR_API_URL, timeout=30)
+    log.info("  → HTTP %s  %.0f ms", resp.status_code, resp.elapsed.total_seconds() * 1000)
     resp.raise_for_status()
-    data = resp.json()
 
+    data = resp.json()
     assets = data["data"][0]["attributes"]["assets"]["data"]
+    all_isins  = [a["attributes"]["isin"] for a in assets]
     active = [
         a["attributes"]["isin"]
         for a in assets
         if a["attributes"].get("status") == "active"
     ]
-    print(f"  Total assets: {len(assets)}, active: {len(active)}")
+
+    log.info("  inzhur: %d total assets, %d active", len(all_isins), len(active))
+    for a in assets:
+        attrs = a["attributes"]
+        marker = "✓" if attrs.get("status") == "active" else "✗"
+        log.info("    %s  %s  [%s]", marker, attrs["isin"], attrs.get("status", "?"))
+
     return active
 
 
@@ -74,13 +92,21 @@ def fetch_active_isins() -> list[str]:
 def fetch_nbu(isin: str) -> list[dict]:
     """Return raw payment records from NBU for a given ISIN."""
     url = NBU_API_TEMPLATE.format(isin=isin)
+    log.info("  GET NBU %s", url)
     try:
         resp = SESSION.get(url, timeout=15)
+        elapsed = resp.elapsed.total_seconds() * 1000
+        log.info("    → HTTP %s  %.0f ms  %d records", resp.status_code, elapsed, len(resp.json()) if resp.ok else 0)
         resp.raise_for_status()
         data = resp.json()
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            log.warning("    unexpected NBU response type: %s", type(data).__name__)
+            return []
+        for rec in data:
+            log.debug("    record: %s", json.dumps(rec, ensure_ascii=False))
+        return data
     except Exception as exc:
-        print(f"  [warn] NBU request failed for {isin}: {exc}")
+        log.warning("    NBU request failed: %s", exc)
         return []
 
 
@@ -123,21 +149,41 @@ def find_upcoming_coupons(payments: list[dict]) -> list[dict]:
 def build_candidates(isins: list[str]) -> list[dict]:
     """Query NBU for each ISIN and collect bonds with upcoming coupon payments."""
     candidates = []
-    for isin in isins:
+    today = date.today()
+    cutoff = today + timedelta(days=COUPON_WINDOW_DAYS)
+
+    log.info("\nQuerying NBU for %d ISINs (window: %s → %s) …", len(isins), today, cutoff)
+
+    for idx, isin in enumerate(isins, 1):
+        log.info("[%d/%d] %s", idx, len(isins), isin)
         payments = fetch_nbu(isin)
         time.sleep(NBU_REQUEST_DELAY)
 
-        upcoming = find_upcoming_coupons(payments)
-        if not upcoming:
+        if not payments:
+            log.info("    → no data from NBU, skipping")
             continue
 
         coupon_rate = extract_coupon_rate(payments)
-        candidates.append({
-            "isin": isin,
-            "couponRate": coupon_rate,
-            "upcomingCoupons": upcoming,
-        })
-        print(f"  {isin}  rate={coupon_rate}%  next_coupon={upcoming[0]['date']}")
+        upcoming = find_upcoming_coupons(payments)
+
+        all_coupons = [p for p in payments if str(p.get("pay_type", "")) == "1"]
+        log.info(
+            "    couponRate=%-6s  total_coupon_records=%d  upcoming=%d",
+            f"{coupon_rate}%" if coupon_rate is not None else "n/a",
+            len(all_coupons),
+            len(upcoming),
+        )
+
+        if upcoming:
+            for c in upcoming:
+                log.info("    ✓ upcoming coupon: %s  amount=%s", c["date"], c["amount"])
+            candidates.append({
+                "isin": isin,
+                "couponRate": coupon_rate,
+                "upcomingCoupons": upcoming,
+            })
+        else:
+            log.info("    – no coupons in window")
 
     return candidates
 
@@ -145,43 +191,60 @@ def build_candidates(isins: list[str]) -> list[dict]:
 # ── Step 4: fire routine ───────────────────────────────────────────────────────
 
 def fire_routine(bonds: list[dict]) -> None:
-    payload = {
-        "text": json.dumps(
-            {
-                "analysisDate": date.today().isoformat(),
-                "windowDays": COUPON_WINDOW_DAYS,
-                "bonds": bonds,
-            },
-            ensure_ascii=False,
-        )
-    }
+    text = json.dumps(
+        {
+            "analysisDate": date.today().isoformat(),
+            "windowDays": COUPON_WINDOW_DAYS,
+            "bonds": bonds,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    log.info("\nPayload to routine:\n%s", text)
+
+    payload = {"text": text}
     headers = {
         "Authorization": f"Bearer {TOKEN}",
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "experimental-cc-routine-2026-04-01",
         "Content-Type": "application/json",
     }
-    print("\nFiring Anthropic routine …")
+
+    log.info("POST %s", ROUTINE_URL)
     resp = requests.post(ROUTINE_URL, headers=headers, json=payload, timeout=60)
+    elapsed = resp.elapsed.total_seconds() * 1000
+    log.info("  → HTTP %s  %.0f ms", resp.status_code, elapsed)
     resp.raise_for_status()
-    print(f"  Done: HTTP {resp.status_code}")
+
+    body = resp.json()
+    log.info("  routine response: %s", json.dumps(body, ensure_ascii=False))
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     today = date.today()
-    print(f"Analysis date: {today.isoformat()}, window: {COUPON_WINDOW_DAYS} days\n")
+    log.info("=" * 60)
+    log.info("OVDP Analysis started")
+    log.info("Date: %s   Window: %d days", today.isoformat(), COUPON_WINDOW_DAYS)
+    log.info("=" * 60)
 
     isins = fetch_active_isins()
 
-    print(f"\nQuerying NBU for {len(isins)} active bonds …")
     candidates = build_candidates(isins)
 
-    print(f"\nBonds with upcoming coupons: {len(candidates)}")
+    log.info("\n" + "=" * 60)
+    log.info("SUMMARY: %d bond(s) with upcoming coupons", len(candidates))
+    if candidates:
+        log.info("%-16s  %-8s  %s", "ISIN", "Rate %", "Next coupon")
+        log.info("-" * 45)
+        for b in sorted(candidates, key=lambda x: float(x["couponRate"] or 0), reverse=True):
+            log.info("%-16s  %-8s  %s", b["isin"], f"{b['couponRate']}%", b["upcomingCoupons"][0]["date"])
+    log.info("=" * 60)
 
     if not candidates:
-        print("No qualifying bonds found — nothing sent to routine.")
+        log.warning("No qualifying bonds found — nothing sent to routine.")
         sys.exit(0)
 
     fire_routine(candidates)
+    log.info("Done.")
