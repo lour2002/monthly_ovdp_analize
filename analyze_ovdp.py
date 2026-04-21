@@ -36,6 +36,8 @@ INZHUR_API_URL = (
     "&populate[SEO]=false"
     "&populate[assets][fields][0]=isin"
     "&populate[assets][fields][1]=status"
+    "&populate[assets][populate][securityProperties][fields][0]=id"
+    "&populate[assets][populate][securityProperties][fields][1]=availableQuantity"
 )
 
 NBU_API_URL = "https://bank.gov.ua/depo_securities?json"
@@ -60,7 +62,8 @@ SESSION.headers.update({"User-Agent": "OVDP-Analyzer/1.0", "Accept": "applicatio
 
 # ── Step 1: fetch active ISINs from inzhur ─────────────────────────────────────
 
-def fetch_active_isins() -> list[str]:
+def fetch_active_assets() -> list[dict]:
+    """Return list of active assets: {isin, availableQuantity}."""
     log.info("GET %s", INZHUR_API_URL)
     resp = SESSION.get(INZHUR_API_URL, timeout=30)
     log.info("  → HTTP %s  %.0f ms", resp.status_code, resp.elapsed.total_seconds() * 1000)
@@ -71,10 +74,18 @@ def fetch_active_isins() -> list[str]:
     for a in assets:
         attrs = a["attributes"]
         status = attrs.get("status", "?")
+
+        # securityProperties may be {"data": {"id": N, "attributes": {...}}} or flat
+        sp = attrs.get("securityProperties") or {}
+        if isinstance(sp, dict) and "data" in sp:
+            sp = (sp["data"] or {}).get("attributes", {})
+        qty = sp.get("availableQuantity") if isinstance(sp, dict) else None
+
         marker = "✓" if status == "active" else "✗"
-        log.info("    %s  %s  [%s]", marker, attrs["isin"], status)
+        log.info("    %s  %s  [%s]  availableQty=%s", marker, attrs["isin"], status, qty)
+
         if status == "active":
-            active.append(attrs["isin"])
+            active.append({"isin": attrs["isin"], "availableQuantity": qty})
 
     log.info("  total: %d  active: %d", len(assets), len(active))
     return active
@@ -97,17 +108,21 @@ def fetch_nbu_all() -> list[dict]:
 
 # ── Step 3: build candidate list ──────────────────────────────────────────────
 
-def build_candidates(active_isins: list[str], nbu_bonds: list[dict]) -> list[dict]:
+def build_candidates(active_assets: list[dict], nbu_bonds: list[dict]) -> list[dict]:
     today = date.today()
 
-    log.info("\nMatching %d active ISINs against NBU data …", len(active_isins))
+    log.info("\nMatching %d active assets against NBU data …", len(active_assets))
 
     nbu_index = {b["cpcode"]: b for b in nbu_bonds if "cpcode" in b}
+    active_isins = {a["isin"] for a in active_assets}
     log.info("  NBU total bonds: %d  matched: %d",
-             len(nbu_bonds), len(set(active_isins) & nbu_index.keys()))
+             len(nbu_bonds), len(active_isins & nbu_index.keys()))
+
+    qty_map = {a["isin"]: a["availableQuantity"] for a in active_assets}
 
     candidates = []
-    for isin in active_isins:
+    for asset in active_assets:
+        isin = asset["isin"]
         bond = nbu_index.get(isin)
         if not bond:
             log.info("  %-16s  → not found in NBU", isin)
@@ -129,16 +144,19 @@ def build_candidates(active_isins: list[str], nbu_bonds: list[dict]) -> list[dic
                 if next_coupon is None or pay_date < date.fromisoformat(next_coupon["date"]):
                     next_coupon = {"date": pay_date.isoformat(), "amount": p.get("pay_val")}
 
+        qty = qty_map.get(isin)
         log.info(
-            "  %-16s  rate=%-6s  next_coupon=%s",
+            "  %-16s  rate=%-6s  qty=%-8s  next_coupon=%s",
             isin,
             f"{coupon_rate}%" if coupon_rate is not None else "n/a",
+            qty if qty is not None else "n/a",
             next_coupon["date"] if next_coupon else "none",
         )
 
         candidates.append({
             "isin": isin,
             "couponRate": coupon_rate,
+            "availableQuantity": qty,
             "nextCoupon": next_coupon,
         })
 
@@ -180,18 +198,19 @@ if __name__ == "__main__":
              date.today().isoformat(), COUPON_WINDOW_DAYS)
     log.info("=" * 60)
 
-    active_isins = fetch_active_isins()
-    nbu_bonds    = fetch_nbu_all()
-    candidates   = build_candidates(active_isins, nbu_bonds)
+    active_assets = fetch_active_assets()
+    nbu_bonds     = fetch_nbu_all()
+    candidates    = build_candidates(active_assets, nbu_bonds)
 
     log.info("\n" + "=" * 60)
-    log.info("SUMMARY: %d bond(s) with upcoming coupons", len(candidates))
+    log.info("SUMMARY: %d active bond(s)", len(candidates))
     if candidates:
-        log.info("  %-16s  %-8s  %s", "ISIN", "Rate %", "Next coupon")
-        log.info("  " + "-" * 42)
+        log.info("  %-16s  %-8s  %-10s  %s", "ISIN", "Rate %", "Qty", "Next coupon")
+        log.info("  " + "-" * 54)
         for b in sorted(candidates, key=lambda x: float(x["couponRate"] or 0), reverse=True):
             next_date = b["nextCoupon"]["date"] if b["nextCoupon"] else "—"
-            log.info("  %-16s  %-8s  %s", b["isin"], f"{b['couponRate']}%", next_date)
+            log.info("  %-16s  %-8s  %-10s  %s",
+                     b["isin"], f"{b['couponRate']}%", b["availableQuantity"], next_date)
     log.info("=" * 60)
 
     if not candidates:
