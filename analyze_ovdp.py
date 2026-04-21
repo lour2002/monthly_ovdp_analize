@@ -2,9 +2,10 @@
 """
 OVDP Monthly Analysis Script
 
-Fetches active OVDP (Ukrainian government bonds) from inzhur.reit,
-filters bonds with upcoming coupon payments, selects top-2 by coupon rate,
-and fires the Anthropic Claude Code routine for analysis and Notion reporting.
+1. Fetch active OVDP ISINs from www.inzhur.reit
+2. For each ISIN query NBU for payment schedule
+3. Filter bonds with coupon payments in the next 30 days
+4. Fire Anthropic Claude Code routine with the filtered list
 
 Usage:
     ANTHROPIC_ROUTINE_TOKEN=<token> python analyze_ovdp.py
@@ -13,6 +14,7 @@ Usage:
 import json
 import os
 import sys
+import time
 from datetime import date, timedelta
 
 import requests
@@ -20,18 +22,11 @@ import requests
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 INZHUR_API_URL = (
-    "https://inzhur.reit/api/asset-pages"
+    "https://www.inzhur.reit/api/asset-pages"
     "?filters[$and][0][slug][$eqi]=ovdp"
     "&populate[SEO]=false"
     "&populate[assets][fields][0]=isin"
     "&populate[assets][fields][1]=status"
-    "&populate[assets][fields][2]=securityProperties.availableQuantity"
-    "&populate[assets][populate][securityProperties][fields][0]=id"
-    "&populate[assets][populate][securityProperties][fields][1]=active"
-    "&populate[assets][populate][securityProperties][fields][2]=availableQuantity"
-    "&populate[assets][populate][paymentSchedule]=*"
-    "&populate[Sections][on][assets.bond-units][populate][bondSegments][fields][0]=couponRate"
-    "&populate[Sections][on][assets.bond-units][populate][paymentSchedule]=*"
 )
 
 NBU_API_TEMPLATE = "https://bank.gov.ua/depo_securities?json&isin={isin}"
@@ -42,7 +37,7 @@ ROUTINE_URL = (
 )
 
 COUPON_WINDOW_DAYS = 30
-TOP_N = 2
+NBU_REQUEST_DELAY = 0.3   # seconds between NBU requests to avoid rate limiting
 
 TOKEN = os.environ.get("ANTHROPIC_ROUTINE_TOKEN")
 if not TOKEN:
@@ -55,178 +50,101 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "OVDP-Analyzer/1.0", "Accept": "application/json"})
 
 
-# ── Fetch ──────────────────────────────────────────────────────────────────────
+# ── Step 1: fetch active ISINs from inzhur ─────────────────────────────────────
 
-def fetch_inzhur():
-    """Return raw JSON from inzhur.reit OVDP page."""
-    print("Fetching OVDP data from inzhur.reit …")
+def fetch_active_isins() -> list[str]:
+    """Return list of active OVDP ISINs from inzhur.reit."""
+    print("Fetching OVDP list from www.inzhur.reit …")
     resp = SESSION.get(INZHUR_API_URL, timeout=30)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+
+    assets = data["data"][0]["attributes"]["assets"]["data"]
+    active = [
+        a["attributes"]["isin"]
+        for a in assets
+        if a["attributes"].get("status") == "active"
+    ]
+    print(f"  Total assets: {len(assets)}, active: {len(active)}")
+    return active
 
 
-def fetch_nbu_coupons(isin: str) -> list[dict]:
-    """Fetch coupon payments (pay_type=1) from NBU for a given ISIN."""
+# ── Step 2: fetch payment schedule from NBU ────────────────────────────────────
+
+def fetch_nbu(isin: str) -> list[dict]:
+    """Return raw payment records from NBU for a given ISIN."""
     url = NBU_API_TEMPLATE.format(isin=isin)
     try:
         resp = SESSION.get(url, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        return [p for p in data if str(p.get("pay_type", "")) == "1"]
+        return data if isinstance(data, list) else []
     except Exception as exc:
         print(f"  [warn] NBU request failed for {isin}: {exc}")
         return []
 
 
-# ── Parse ──────────────────────────────────────────────────────────────────────
-
-def extract_assets(raw: dict) -> list[dict]:
-    """
-    Extract flat asset list from Strapi response.
-    Returns list of dicts with keys: isin, status, availableQuantity,
-    couponRate, paymentSchedule.
-    """
-    pages = raw.get("data", [])
-    if not pages:
-        return []
-
-    attrs = pages[0].get("attributes", {})
-
-    # Build isin→couponRate map from Sections[].bondSegments
-    coupon_map: dict[str, float | None] = {}
-    section_schedule: dict[str, list] = {}
-    for section in attrs.get("Sections", []):
-        if section.get("__component") != "assets.bond-units":
-            continue
-        sched = section.get("paymentSchedule") or []
-
-        # bondSegments may be a Strapi relation {"data":[...]} or a plain list
-        segs_raw = section.get("bondSegments") or []
-        if isinstance(segs_raw, dict):
-            segs_raw = segs_raw.get("data") or []
-
-        for seg in segs_raw:
-            if not isinstance(seg, dict):
-                print(f"  [warn] unexpected bondSegment type {type(seg).__name__}: {seg!r}")
-                continue
-            # Strapi relation items wrap fields under "attributes"
-            seg_attrs = seg.get("attributes", seg)
-            isin = seg_attrs.get("isin", "")
-            coupon_rate = seg_attrs.get("couponRate")
-            if isin:
-                coupon_map[isin] = coupon_rate
-                if isin not in section_schedule:
-                    section_schedule[isin] = sched
-            else:
-                print(f"  [warn] bondSegment missing isin, couponRate={coupon_rate}")
-
-    assets_data = attrs.get("assets", {})
-    if isinstance(assets_data, dict):
-        raw_list = assets_data.get("data", [])
-    else:
-        raw_list = assets_data or []
-
-    result = []
-    for item in raw_list:
-        a = item.get("attributes", item)
-        isin = a.get("isin", "")
-
-        # availableQuantity — may be nested inside securityProperties
-        sp = a.get("securityProperties") or {}
-        if isinstance(sp, dict):
-            sp = sp.get("data") or sp
-            sp = sp.get("attributes") or sp if isinstance(sp, dict) else {}
-        qty = sp.get("availableQuantity", 0) or 0
-
-        schedule = a.get("paymentSchedule") or section_schedule.get(isin) or []
-
-        result.append({
-            "isin": isin,
-            "status": a.get("status", ""),
-            "availableQuantity": qty,
-            "couponRate": coupon_map.get(isin),
-            "paymentSchedule": schedule,
-        })
-
-    return result
+def extract_coupon_rate(payments: list[dict]) -> float | None:
+    """Extract annual coupon rate (%) from NBU payment records."""
+    for p in payments:
+        for field in ("couponrate", "coupon_rate", "cpn_percent", "rate", "coupon"):
+            val = p.get(field)
+            if val is not None:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    pass
+    return None
 
 
-# ── Filter ─────────────────────────────────────────────────────────────────────
-
-def filter_active(assets: list[dict]) -> list[dict]:
-    return [a for a in assets if a["status"] == "active" and a["availableQuantity"] > 0]
-
-
-def upcoming_coupons(schedule: list[dict], window: int = COUPON_WINDOW_DAYS) -> list[dict]:
-    """Return coupon payments within next `window` days."""
+def find_upcoming_coupons(payments: list[dict]) -> list[dict]:
+    """Return coupon payments (pay_type=1) within next COUPON_WINDOW_DAYS days."""
     today = date.today()
-    cutoff = today + timedelta(days=window)
-    hits = []
-    for p in schedule:
-        raw_date = (
-            p.get("date") or p.get("pay_date") or p.get("payDate") or ""
-        )
-        pay_type = str(p.get("pay_type") or p.get("payType") or p.get("type") or "1")
-
+    cutoff = today + timedelta(days=COUPON_WINDOW_DAYS)
+    result = []
+    for p in payments:
+        if str(p.get("pay_type", "")) != "1":
+            continue
+        raw_date = p.get("pay_date") or p.get("date") or ""
         try:
             pay_date = date.fromisoformat(str(raw_date)[:10])
         except ValueError:
             continue
-
-        is_coupon = pay_type in ("1", "coupon") or "coupon" in pay_type.lower()
-        if is_coupon and today <= pay_date <= cutoff:
-            hits.append({
+        if today <= pay_date <= cutoff:
+            result.append({
                 "date": pay_date.isoformat(),
-                "amount": p.get("amount") or p.get("pay_val") or p.get("value"),
+                "amount": p.get("pay_val") or p.get("amount"),
             })
-    return hits
+    return result
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Step 3: build candidate list ───────────────────────────────────────────────
 
-def build_report() -> list[dict]:
-    raw = fetch_inzhur()
-    all_assets = extract_assets(raw)
-    print(f"  Total assets: {len(all_assets)}")
-
-    active = filter_active(all_assets)
-    print(f"  Active with quantity > 0: {len(active)}")
-
+def build_candidates(isins: list[str]) -> list[dict]:
+    """Query NBU for each ISIN and collect bonds with upcoming coupon payments."""
     candidates = []
-    for asset in active:
-        schedule = asset["paymentSchedule"]
-        if not schedule:
-            print(f"  [{asset['isin']}] paymentSchedule empty — querying NBU …")
-            schedule = fetch_nbu_coupons(asset["isin"])
+    for isin in isins:
+        payments = fetch_nbu(isin)
+        time.sleep(NBU_REQUEST_DELAY)
 
-        coupons = upcoming_coupons(schedule)
-        if not coupons:
+        upcoming = find_upcoming_coupons(payments)
+        if not upcoming:
             continue
 
+        coupon_rate = extract_coupon_rate(payments)
         candidates.append({
-            "isin": asset["isin"],
-            "couponRate": asset["couponRate"],
-            "availableQuantity": asset["availableQuantity"],
-            "upcomingCoupons": coupons,
+            "isin": isin,
+            "couponRate": coupon_rate,
+            "upcomingCoupons": upcoming,
         })
+        print(f"  {isin}  rate={coupon_rate}%  next_coupon={upcoming[0]['date']}")
 
-    print(f"  Bonds with coupons in next {COUPON_WINDOW_DAYS}d: {len(candidates)}")
-
-    candidates.sort(key=lambda x: float(x["couponRate"] or 0), reverse=True)
-    top = candidates[:TOP_N]
-
-    print(f"\nTop-{TOP_N} by coupon rate:")
-    for b in top:
-        print(
-            f"  {b['isin']:16s}  rate={b['couponRate']}%"
-            f"  next={b['upcomingCoupons'][0]['date']}"
-            f"  qty={b['availableQuantity']}"
-        )
-
-    return top
+    return candidates
 
 
-def fire_routine(bonds: list[dict]) -> dict:
+# ── Step 4: fire routine ───────────────────────────────────────────────────────
+
+def fire_routine(bonds: list[dict]) -> None:
     payload = {
         "text": json.dumps(
             {
@@ -246,14 +164,24 @@ def fire_routine(bonds: list[dict]) -> dict:
     print("\nFiring Anthropic routine …")
     resp = requests.post(ROUTINE_URL, headers=headers, json=payload, timeout=60)
     resp.raise_for_status()
-    result = resp.json()
-    print(f"  Routine response: {resp.status_code} — {result}")
-    return result
+    print(f"  Done: HTTP {resp.status_code}")
 
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    top_bonds = build_report()
-    if top_bonds:
-        fire_routine(top_bonds)
-    else:
-        print("\nNo qualifying bonds found — nothing sent to routine.")
+    today = date.today()
+    print(f"Analysis date: {today.isoformat()}, window: {COUPON_WINDOW_DAYS} days\n")
+
+    isins = fetch_active_isins()
+
+    print(f"\nQuerying NBU for {len(isins)} active bonds …")
+    candidates = build_candidates(isins)
+
+    print(f"\nBonds with upcoming coupons: {len(candidates)}")
+
+    if not candidates:
+        print("No qualifying bonds found — nothing sent to routine.")
+        sys.exit(0)
+
+    fire_routine(candidates)
