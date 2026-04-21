@@ -45,7 +45,7 @@ ROUTINE_URL = (
     "trig_01TEs2S3TcShv7vDdxnjKmfx/fire"
 )
 
-COUPON_WINDOW_DAYS = 30
+COUPON_WINDOW_DAYS = 30  # kept for payload metadata only
 
 TOKEN = os.environ.get("ANTHROPIC_ROUTINE_TOKEN")
 if not TOKEN:
@@ -95,19 +95,16 @@ def fetch_nbu_all() -> list[dict]:
     return data
 
 
-# ── Step 3: filter and build candidate list ────────────────────────────────────
+# ── Step 3: build candidate list ──────────────────────────────────────────────
 
 def build_candidates(active_isins: list[str], nbu_bonds: list[dict]) -> list[dict]:
     today = date.today()
-    cutoff = today + timedelta(days=COUPON_WINDOW_DAYS)
-    active_set = set(active_isins)
 
-    log.info("\nFiltering NBU bonds by active ISINs (window: %s → %s) …", today, cutoff)
+    log.info("\nMatching %d active ISINs against NBU data …", len(active_isins))
 
-    # index NBU data by cpcode for O(1) lookup
     nbu_index = {b["cpcode"]: b for b in nbu_bonds if "cpcode" in b}
-    log.info("  NBU total bonds: %d  matched with inzhur: %d",
-             len(nbu_bonds), len(active_set & nbu_index.keys()))
+    log.info("  NBU total bonds: %d  matched: %d",
+             len(nbu_bonds), len(set(active_isins) & nbu_index.keys()))
 
     candidates = []
     for isin in active_isins:
@@ -118,36 +115,32 @@ def build_candidates(active_isins: list[str], nbu_bonds: list[dict]) -> list[dic
 
         coupon_rate = bond.get("auk_proc")
         payments = bond.get("payments") or []
-        coupon_payments = [p for p in payments if str(p.get("pay_type", "")) == "1"]
 
-        upcoming = []
-        for p in coupon_payments:
+        # find nearest future coupon (pay_type=1)
+        next_coupon = None
+        for p in payments:
+            if str(p.get("pay_type", "")) != "1":
+                continue
             try:
                 pay_date = date.fromisoformat(str(p["pay_date"])[:10])
             except (ValueError, KeyError):
                 continue
-            if today <= pay_date <= cutoff:
-                upcoming.append({
-                    "date": pay_date.isoformat(),
-                    "amount": p.get("pay_val"),
-                })
+            if pay_date >= today:
+                if next_coupon is None or pay_date < date.fromisoformat(next_coupon["date"]):
+                    next_coupon = {"date": pay_date.isoformat(), "amount": p.get("pay_val")}
 
         log.info(
-            "  %-16s  rate=%-6s  coupon_records=%-3d  upcoming=%d",
+            "  %-16s  rate=%-6s  next_coupon=%s",
             isin,
             f"{coupon_rate}%" if coupon_rate is not None else "n/a",
-            len(coupon_payments),
-            len(upcoming),
+            next_coupon["date"] if next_coupon else "none",
         )
-        for c in upcoming:
-            log.info("    ✓ %s  amount=%s", c["date"], c["amount"])
 
-        if upcoming:
-            candidates.append({
-                "isin": isin,
-                "couponRate": coupon_rate,
-                "upcomingCoupons": upcoming,
-            })
+        candidates.append({
+            "isin": isin,
+            "couponRate": coupon_rate,
+            "nextCoupon": next_coupon,
+        })
 
     return candidates
 
@@ -197,12 +190,12 @@ if __name__ == "__main__":
         log.info("  %-16s  %-8s  %s", "ISIN", "Rate %", "Next coupon")
         log.info("  " + "-" * 42)
         for b in sorted(candidates, key=lambda x: float(x["couponRate"] or 0), reverse=True):
-            log.info("  %-16s  %-8s  %s",
-                     b["isin"], f"{b['couponRate']}%", b["upcomingCoupons"][0]["date"])
+            next_date = b["nextCoupon"]["date"] if b["nextCoupon"] else "—"
+            log.info("  %-16s  %-8s  %s", b["isin"], f"{b['couponRate']}%", next_date)
     log.info("=" * 60)
 
     if not candidates:
-        log.warning("No qualifying bonds found — nothing sent to routine.")
+        log.warning("No active bonds found — nothing sent to routine.")
         sys.exit(0)
 
     fire_routine(candidates)
