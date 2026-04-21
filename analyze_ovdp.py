@@ -102,25 +102,41 @@ def fetch_inzhur_bonds() -> list[dict]:
 
 # ── Step 2: find next coupon ──────────────────────────────────────────────────
 
-def find_next_coupon(schedule: list[dict]) -> dict | None:
+def find_next_coupon(schedule: list[dict], isin: str = "") -> dict | None:
     """
     Return the nearest future coupon payment {date, amount} from a schedule.
     Amounts are stored in kopecks — converted to UAH (divided by 100, rounded to 2).
+    Handles both inzhur field names (date/type) and NBU-style (pay_date/pay_type).
     """
+    if not schedule:
+        return None
+
+    # Log first entry to reveal actual field names
+    log.debug("  [%s] paymentSchedule sample: %s", isin, schedule[0])
+
     today = date.today()
     best = None
     for p in schedule:
-        if str(p.get("pay_type", "")) != "1":
+        # accept both field name conventions
+        raw_type = p.get("pay_type") or p.get("type") or p.get("payType") or ""
+        raw_date = p.get("pay_date") or p.get("date") or p.get("payDate") or ""
+
+        # coupon = pay_type "1" or 1; skip repayment (type 2) and others
+        if str(raw_type) not in ("1", "coupon"):
             continue
+
         try:
-            pay_date = date.fromisoformat(str(p.get("pay_date", ""))[:10])
+            pay_date = date.fromisoformat(str(raw_date)[:10])
         except ValueError:
+            log.debug("  [%s] unparseable date: %r", isin, raw_date)
             continue
+
         if pay_date >= today:
             if best is None or pay_date < date.fromisoformat(best["date"]):
-                raw_amount = p.get("amount")
+                raw_amount = p.get("amount") or p.get("pay_val")
                 amount_uah = round(raw_amount / 100, 2) if raw_amount is not None else None
                 best = {"date": pay_date.isoformat(), "amount": amount_uah}
+
     return best
 
 
@@ -133,8 +149,13 @@ def build_candidates(inzhur_bonds: list[dict]) -> list[dict]:
 
     candidates = []
     for bond in inzhur_bonds:
-        isin        = bond["isin"]
-        next_coupon = find_next_coupon(bond["paymentSchedule"])
+        isin     = bond["isin"]
+        schedule = bond["paymentSchedule"]
+        if schedule:
+            log.info("  [%s] schedule[0] raw: %s", isin, schedule[0])
+        else:
+            log.info("  [%s] paymentSchedule is empty", isin)
+        next_coupon = find_next_coupon(schedule, isin)
 
         fire = (
             next_coupon is not None
