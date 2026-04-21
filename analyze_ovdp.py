@@ -99,11 +99,26 @@ def extract_assets(raw: dict) -> list[dict]:
         if section.get("__component") != "assets.bond-units":
             continue
         sched = section.get("paymentSchedule") or []
-        for seg in section.get("bondSegments") or []:
-            isin = seg.get("isin", "")
-            coupon_map[isin] = seg.get("couponRate")
-            if isin not in section_schedule:
-                section_schedule[isin] = sched
+
+        # bondSegments may be a Strapi relation {"data":[...]} or a plain list
+        segs_raw = section.get("bondSegments") or []
+        if isinstance(segs_raw, dict):
+            segs_raw = segs_raw.get("data") or []
+
+        for seg in segs_raw:
+            if not isinstance(seg, dict):
+                print(f"  [warn] unexpected bondSegment type {type(seg).__name__}: {seg!r}")
+                continue
+            # Strapi relation items wrap fields under "attributes"
+            seg_attrs = seg.get("attributes", seg)
+            isin = seg_attrs.get("isin", "")
+            coupon_rate = seg_attrs.get("couponRate")
+            if isin:
+                coupon_map[isin] = coupon_rate
+                if isin not in section_schedule:
+                    section_schedule[isin] = sched
+            else:
+                print(f"  [warn] bondSegment missing isin, couponRate={coupon_rate}")
 
     assets_data = attrs.get("assets", {})
     if isinstance(assets_data, dict):
