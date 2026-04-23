@@ -163,7 +163,7 @@ def build_candidates(inzhur_bonds: list[dict]) -> list[dict]:
             and today <= date.fromisoformat(next_coupon["date"]) <= cutoff
         )
 
-        if next_coupon["date"] and fire:
+        if  next_coupon is not None and fire:
             next_coupon["date"] += " 🔥"
 
         log.info(
