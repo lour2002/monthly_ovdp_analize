@@ -164,7 +164,7 @@ def build_candidates(inzhur_bonds: list[dict]) -> list[dict]:
         )
 
         if  next_coupon is not None and fire:
-            next_coupon["fire"] = true
+            next_coupon["fire"] = True
 
         log.info(
             "  %-16s  qty=%-10s  buy=%-8s  sell=%-8s  next=%s%s",
