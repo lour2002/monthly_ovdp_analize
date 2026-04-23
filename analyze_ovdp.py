@@ -164,7 +164,7 @@ def build_candidates(inzhur_bonds: list[dict]) -> list[dict]:
         )
 
         if  next_coupon is not None and fire:
-            next_coupon["date"] += " 🔥"
+            next_coupon["fire"] = true
 
         log.info(
             "  %-16s  qty=%-10s  buy=%-8s  sell=%-8s  next=%s%s",
@@ -173,7 +173,6 @@ def build_candidates(inzhur_bonds: list[dict]) -> list[dict]:
             bond["priceBuy"]  if bond["priceBuy"]  is not None else "—",
             bond["priceSell"] if bond["priceSell"] is not None else "—",
             next_coupon["date"] if next_coupon else "none",
-            "  🔥" if fire else "",
         )
 
         candidates.append({
@@ -235,15 +234,13 @@ if __name__ == "__main__":
         cutoff = today + timedelta(days=COUPON_WINDOW_DAYS)
         for b in candidates:
             nc = b["nextCoupon"]
-            next_str = nc["date"] if nc else "—"
-            if nc and today <= date.fromisoformat(nc["date"]) <= cutoff:
-                next_str = "🔥 " + next_str
+
             log.info("  %-16s  %-8s  %-8s  %-10s  %s",
                      b["isin"],
                      b["priceBuy"]  if b["priceBuy"]  is not None else "—",
                      b["priceSell"] if b["priceSell"] is not None else "—",
                      b["availableQuantity"] if b["availableQuantity"] is not None else "—",
-                     next_str)
+                     nc["date"] if nc else "—")
     log.info("=" * 60)
 
     if not candidates:
