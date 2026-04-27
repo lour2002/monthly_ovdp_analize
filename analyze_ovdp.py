@@ -175,11 +175,14 @@ def build_candidates(inzhur_bonds: list[dict]) -> list[dict]:
             next_coupon["date"] if next_coupon else "none",
         )
 
+        returnRate = bond["returnRates"] and bond["returnRates"]["buy"]
+
         candidates.append({
             "isin":              isin,
             "availableQuantity": bond["availableQuantity"],
             "priceBuy":          bond["priceBuy"],
             "priceSell":         bond["priceSell"],
+            "returnRate":        returnRate,
             "nextCoupon":        next_coupon,
         })
 
