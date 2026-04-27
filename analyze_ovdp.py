@@ -78,6 +78,7 @@ def fetch_inzhur_bonds() -> list[dict]:
         qty        = sp.get("availableQuantity")
         prices     = details.get("prices") or {}
         schedule   = details.get("paymentSchedule") or []
+        returnRates= details.get("returnRates") or {}
 
         is_target = asset_type == "bond" and status == "active"
         marker = "✓" if is_target else "✗"
@@ -94,6 +95,7 @@ def fetch_inzhur_bonds() -> list[dict]:
                 "priceBuy":          prices.get("buy"),
                 "priceSell":         prices.get("sell"),
                 "paymentSchedule":   schedule,
+                "returnRate":        returnRates.get("sell")
             })
 
     log.info("  active bonds (type=bond, status=active): %d", len(bonds))
@@ -175,14 +177,12 @@ def build_candidates(inzhur_bonds: list[dict]) -> list[dict]:
             next_coupon["date"] if next_coupon else "none",
         )
 
-        returnRate = bond["returnRates"] and bond["returnRates"]["buy"]
-
         candidates.append({
             "isin":              isin,
             "availableQuantity": bond["availableQuantity"],
             "priceBuy":          bond["priceBuy"],
             "priceSell":         bond["priceSell"],
-            "returnRate":        returnRate,
+            "returnRate":        bond["returnRate"],
             "nextCoupon":        next_coupon,
         })
 
