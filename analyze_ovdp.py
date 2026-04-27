@@ -95,7 +95,7 @@ def fetch_inzhur_bonds() -> list[dict]:
                 "priceBuy":          prices.get("buy"),
                 "priceSell":         prices.get("sell"),
                 "paymentSchedule":   schedule,
-                "returnRate":        returnRates.get("sell")
+                "returnRate":        returnRates.get("buy")
             })
 
     log.info("  active bonds (type=bond, status=active): %d", len(bonds))
