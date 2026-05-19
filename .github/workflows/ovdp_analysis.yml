@@ -2,7 +2,7 @@ name: OVDP Monthly Analysis
 
 on:
   schedule:
-    - cron: '0 9 20 * *'   # every 20th at 09:00 UTC
+    - cron: '0 8 1 * *'   # every 20th at 09:00 UTC
   workflow_dispatch:         # manual trigger for testing
 
 jobs:
